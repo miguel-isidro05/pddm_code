@@ -30,8 +30,7 @@ Si no están, el script fallará al cargar los `.mat`.
 
 1. Para ello ir a: https://www.bbci.de/competition/iii/download/index.html?agree=yes&submit=Submit
 
-2. Descargar solo el subject 1 subject1 [ ASCII format (68 MB) ] [ Matlab format (45 MB) ], descargando solo el formato en .mat y posterior dejar los archivos .mat como `dataset/BCI_3/train_subject1_raw0X.mat/`:
-3. 
+2. Descargar solo el subject 1 subject1 [ ASCII format (68 MB) ] [ Matlab format (45 MB) ], descargando solo el formato en .mat y posterior dejar los archivos .mat como `dataset/BCI_3/train_subject1_raw0X.mat/`.
 ---
 
 ## 1) Crear un conda environment
