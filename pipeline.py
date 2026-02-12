@@ -362,6 +362,117 @@ def build_epochs_from_labels(
     return epochs, labels
 
 
+def build_epochs_from_labels_with_groups(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    epoch_samples: int,
+    stride_samples: int,
+    allowed_labels: set[int],
+    max_epochs_per_class: Optional[int],
+    group_offset: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """
+    Same windowing as `build_epochs_from_labels`, but also returns `groups` so that all
+    overlapping windows from the same contiguous-label segment stay together in CV.
+
+    - group_id increments per contiguous label segment (within a session)
+    - all windows produced from that segment share the same group_id
+    """
+    x = np.asarray(x)
+    y = np.asarray(y).reshape(-1)
+    n_times, _ = x.shape
+    if y.shape[0] != n_times:
+        raise ValueError("x and y length mismatch")
+    if epoch_samples <= 0:
+        raise ValueError("epoch_samples must be > 0")
+    if stride_samples <= 0:
+        raise ValueError("stride_samples must be > 0")
+
+    epochs_list: list[np.ndarray] = []
+    labels_list: list[int] = []
+    groups_list: list[int] = []
+
+    per_class_count: dict[int, int] = {int(k): 0 for k in allowed_labels}
+    gid = int(group_offset)
+
+    start = 0
+    while start < n_times:
+        label = int(y[start])
+        end = start + 1
+        while end < n_times and int(y[end]) == label:
+            end += 1
+
+        if label in allowed_labels:
+            # If limiting per class, stop generating once the class reaches the cap.
+            if max_epochs_per_class is not None and int(per_class_count[int(label)]) >= int(max_epochs_per_class):
+                pass
+            else:
+                s = start
+                n_added = 0
+                while s + int(epoch_samples) <= end:
+                    if max_epochs_per_class is not None and int(per_class_count[int(label)]) >= int(max_epochs_per_class):
+                        break
+                    e = s + int(epoch_samples)
+                    ep = x[s:e].T  # (C, T)
+                    epochs_list.append(ep.astype(np.float32, copy=False))
+                    labels_list.append(int(label))
+                    groups_list.append(int(gid))
+                    per_class_count[int(label)] = int(per_class_count[int(label)]) + 1
+                    n_added += 1
+                    s += int(stride_samples)
+                if n_added > 0:
+                    gid += 1
+
+        start = end
+
+    if not epochs_list:
+        raise ValueError("No epochs were created. Check labels and epoch/stride.")
+
+    epochs = np.stack(epochs_list, axis=0)
+    labels = np.asarray(labels_list, dtype=np.int64)
+    groups = np.asarray(groups_list, dtype=np.int64)
+    return epochs, labels, groups, int(gid)
+
+
+def iter_stratified_group_kfold_indices(
+    y: np.ndarray,
+    groups: np.ndarray,
+    *,
+    n_splits: int,
+    seed: int,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Stratified K-fold split at the *group* level.
+    Prevents leakage when samples are overlapping windows.
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    y = np.asarray(y, dtype=int).reshape(-1)
+    groups = np.asarray(groups, dtype=int).reshape(-1)
+    if y.shape[0] != groups.shape[0]:
+        raise ValueError(f"y/groups mismatch: {y.shape} vs {groups.shape}")
+
+    uniq_groups = np.unique(groups)
+    # Each group corresponds to one contiguous-label segment, so label is constant within group.
+    group_to_label: dict[int, int] = {}
+    for g in uniq_groups.tolist():
+        idx = int(np.flatnonzero(groups == int(g))[0])
+        group_to_label[int(g)] = int(y[idx])
+
+    group_labels = np.asarray([group_to_label[int(g)] for g in uniq_groups.tolist()], dtype=int)
+    skf = StratifiedKFold(n_splits=int(n_splits), shuffle=True, random_state=int(seed))
+
+    splits: list[tuple[np.ndarray, np.ndarray]] = []
+    for g_tr_idx, g_va_idx in skf.split(uniq_groups, group_labels):
+        g_tr = set(int(uniq_groups[int(i)]) for i in np.asarray(g_tr_idx, dtype=int).tolist())
+        g_va = set(int(uniq_groups[int(i)]) for i in np.asarray(g_va_idx, dtype=int).tolist())
+        tr_idx = np.flatnonzero(np.isin(groups, list(g_tr))).astype(int)
+        va_idx = np.flatnonzero(np.isin(groups, list(g_va))).astype(int)
+        splits.append((tr_idx, va_idx))
+    return splits
+
+
 def load_window_labels_from_asc(path: str) -> np.ndarray:
     """
     Load per-window labels from a .asc file (one number per line, scientific notation).
@@ -959,7 +1070,7 @@ class EEGNetModel(nn.Module):
         classes: int,
         time_points: int,
         *,
-        temp_kernel: int = 64,
+        temp_kernel: int = 32,
         f1: int = 8,
         d: int = 2,
         f2: int = 16,
@@ -1081,7 +1192,7 @@ def run_eegnet(
 
     model = EEGNetModel(chans=int(X_train.shape[1]), classes=n_classes, time_points=int(X_train.shape[2])).to(device)
     # Requested config: Adam, lr=1e-3, fixed LR
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
 
     train_loader = DataLoader(TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(ytr)), batch_size=int(batch_size), shuffle=True)
@@ -1748,9 +1859,9 @@ def main() -> None:
         choices=["scorenet-unet", "ddpm-unet"],
         help="Backbone para score model. scorenet-unet requiere `SGDM.py` en el mismo directorio.",
     )
-    # Requested defaults for EEGNet (paper-like)
-    parser.add_argument("--cls-epochs", type=int, default=1000, help="Epochs para U-Net classifier y EEGNet")
-    parser.add_argument("--cls-batch-size", type=int, default=64, help="Batch size para U-Net classifier y EEGNet")
+    # Requested defaults for EEGNet
+    parser.add_argument("--cls-epochs", type=int, default=500, help="Epochs para EEGNet")
+    parser.add_argument("--cls-batch-size", type=int, default=64, help="Batch size para EEGNet")
 
     parser.add_argument("--skip-ddpm", action="store_true")
     parser.add_argument("--skip-sgm", action="store_true")
@@ -1854,7 +1965,8 @@ def main() -> None:
 
     # ---- epoching
     EPOCH_SAMPLES = 512
-    STRIDE_SAMPLES = EPOCH_SAMPLES // 2  # 0.5s at 512 Hz
+    # IMPORTANT: avoid 0.5s stride (no overlap by default)
+    STRIDE_SAMPLES = EPOCH_SAMPLES  # 1.0s at 512 Hz
 
     # Usar todas las clases presentes en este dataset (2=left, 3=right, 7=word)
     allowed_labels = set(int(v) for v in np.unique(y_raw).tolist())
@@ -1862,24 +1974,29 @@ def main() -> None:
 
     epochs_parts: list[np.ndarray] = []
     labels_parts_out: list[np.ndarray] = []
+    groups_parts_out: list[np.ndarray] = []
+    group_cursor = 0
     offset = 0
     for n_sess in len_parts:
         x_sess = x_for_epoching[offset : offset + n_sess]
         y_sess = y_raw[offset : offset + n_sess]
-        ep_sess, lab_sess = build_epochs_from_labels(
+        ep_sess, lab_sess, grp_sess, group_cursor = build_epochs_from_labels_with_groups(
             x_sess,
             y_sess,
             epoch_samples=EPOCH_SAMPLES,
             stride_samples=STRIDE_SAMPLES,
             allowed_labels=allowed_labels,
             max_epochs_per_class=max_epochs_per_class,
+            group_offset=int(group_cursor),
         )
         epochs_parts.append(ep_sess)
         labels_parts_out.append(lab_sess)
+        groups_parts_out.append(grp_sess)
         offset += n_sess
 
-    epochs_train = np.concatenate(epochs_parts, axis=0)
+    epochs_train_raw = np.concatenate(epochs_parts, axis=0)
     labels_train = np.concatenate(labels_parts_out, axis=0)
+    groups_train = np.concatenate(groups_parts_out, axis=0)
 
     if bool(args.use_official_test):
         test_mat_path = str(args.test_mat).strip() or f"dataset/BCI_3/test_subject{subject_id}_raw04.mat"
@@ -1894,7 +2011,7 @@ def main() -> None:
         x_test_clean = raw_test.get_data().T.astype(np.float32)
 
         y_test_windows = load_window_labels_from_asc(test_asc_path)
-        epochs_test, labels_test = build_epochs_from_window_labels(
+        epochs_test_raw, labels_test = build_epochs_from_window_labels(
             x_test_clean,
             y_test_windows,
             epoch_samples=EPOCH_SAMPLES,
@@ -1906,21 +2023,26 @@ def main() -> None:
         train_ratio = 0.7
         print("allowed_labels:", sorted(int(v) for v in allowed_labels))
         train_idx, test_idx = stratified_split(labels_train, train_ratio=train_ratio, seed=args.seed)
-        epochs_test = epochs_train[test_idx]
+        epochs_test_raw = epochs_train_raw[test_idx]
         labels_test = labels_train[test_idx]
-        epochs_train = epochs_train[train_idx]
+        epochs_train_raw = epochs_train_raw[train_idx]
         labels_train = labels_train[train_idx]
+        groups_train = groups_train[train_idx]
 
-    # Z-score per channel using TRAIN statistics only (paper-like + no leakage)
-    train_mu = epochs_train.mean(axis=(0, 2), keepdims=True)  # (1, C, 1)
-    train_sd = epochs_train.std(axis=(0, 2), keepdims=True) + 1e-6
-    epochs_train = ((epochs_train - train_mu) / train_sd).astype(np.float32, copy=False)
-    epochs_test = ((epochs_test - train_mu) / train_sd).astype(np.float32, copy=False)
-    print("[z-score] applied per-channel using TRAIN stats only")
-
-    print("epochs_train:", epochs_train.shape, "epochs_test:", epochs_test.shape)
+    # (IMPORTANT) We will z-score:
+    # - inside each CV fold (to avoid leakage)
+    # - once on full TRAIN for final held-out TEST evaluation
+    print("epochs_train_raw:", epochs_train_raw.shape, "epochs_test_raw:", epochs_test_raw.shape)
     print("class balance train:", _class_balance(labels_train))
     print("class balance test :", _class_balance(labels_test))
+
+    # z-score using FULL TRAIN stats ONLY (for final held-out TEST eval and non-CV routines).
+    # CV will re-fit z-score inside each fold to avoid leakage.
+    train_mu_full = epochs_train_raw.mean(axis=(0, 2), keepdims=True)
+    train_sd_full = epochs_train_raw.std(axis=(0, 2), keepdims=True) + 1e-6
+    epochs_train = ((epochs_train_raw - train_mu_full) / train_sd_full).astype(np.float32, copy=False)
+    epochs_test = ((epochs_test_raw - train_mu_full) / train_sd_full).astype(np.float32, copy=False)
+    print("[z-score] prepared (full-TRAIN stats) for held-out TEST; CV uses fold-specific stats")
 
     # ---- diffusion constants (DDPM) for compatibility with pipeline
     TIMESTEPS = 1000
@@ -1972,33 +2094,44 @@ def main() -> None:
     sgm_acc_summary: dict[str, dict[str, dict[str, float]]] = {}
 
     if not args.skip_ddpm:
-        from sklearn.model_selection import StratifiedKFold
-
-        X_train_full = epochs_train
+        X_train_full_raw = epochs_train_raw
         y_train_full = labels_train
-        X_test_real = epochs_test
+        X_test_real_raw = epochs_test_raw
         y_test = labels_test
 
         # -------------------------------
         # 1) TRAIN-only CV (k=5) protocol
         # -------------------------------
-        _log_section(f"DDPM - SUBJECT {subject_id} — TRAIN-only StratifiedKFold CV (k={int(args.cv_folds)})")
-        skf = StratifiedKFold(n_splits=int(args.cv_folds), shuffle=True, random_state=int(args.cv_seed))
+        _log_section(
+            f"DDPM - SUBJECT {subject_id} — TRAIN-only StratifiedGroupKFold (segment-aware) CV (k={int(args.cv_folds)})"
+        )
 
-        cv_acc: dict[str, list[float]] = {k: [] for k in ["CSP+LDA", "FBCSP+LDA", "U-Net", "EEGNet"]}
-        cv_acc_h: dict[str, list[float]] = {k: [] for k in ["CSP+LDA", "FBCSP+LDA", "U-Net", "EEGNet"]}
-        cv_kappa: dict[str, list[float]] = {k: [] for k in ["CSP+LDA", "FBCSP+LDA", "U-Net", "EEGNet"]}
-        cv_kappa_h: dict[str, list[float]] = {k: [] for k in ["CSP+LDA", "FBCSP+LDA", "U-Net", "EEGNet"]}
+        splits = iter_stratified_group_kfold_indices(
+            y_train_full, groups_train, n_splits=int(args.cv_folds), seed=int(args.cv_seed)
+        )
 
-        for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X_train_full, y_train_full), start=1):
+        cv_acc: dict[str, list[float]] = {k: [] for k in ["CSP+LDA", "FBCSP+LDA", "EEGNet"]}
+        cv_acc_h: dict[str, list[float]] = {k: [] for k in ["CSP+LDA", "FBCSP+LDA", "EEGNet"]}
+        cv_kappa: dict[str, list[float]] = {k: [] for k in ["CSP+LDA", "FBCSP+LDA", "EEGNet"]}
+        cv_kappa_h: dict[str, list[float]] = {k: [] for k in ["CSP+LDA", "FBCSP+LDA", "EEGNet"]}
+
+        def _zscore_fit_apply(Xtr_raw: np.ndarray, Xother_raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            mu = Xtr_raw.mean(axis=(0, 2), keepdims=True)
+            sd = Xtr_raw.std(axis=(0, 2), keepdims=True) + 1e-6
+            return ((Xtr_raw - mu) / sd).astype(np.float32, copy=False), ((Xother_raw - mu) / sd).astype(np.float32, copy=False)
+
+        for fold_i, (tr_idx, va_idx) in enumerate(splits, start=1):
             tr_idx = np.asarray(tr_idx, dtype=int)
             va_idx = np.asarray(va_idx, dtype=int)
-            X_tr = np.asarray(X_train_full[tr_idx], dtype=np.float32)
+            X_tr_raw = np.asarray(X_train_full_raw[tr_idx], dtype=np.float32)
             y_tr = np.asarray(y_train_full[tr_idx], dtype=int)
-            X_va_real = np.asarray(X_train_full[va_idx], dtype=np.float32)
+            X_va_real_raw = np.asarray(X_train_full_raw[va_idx], dtype=np.float32)
             y_va = np.asarray(y_train_full[va_idx], dtype=int)
 
             _log_section(f"[CV fold {fold_i}/{int(args.cv_folds)}] Train DDPM on train_real, eval on val_real/val_hybrid")
+
+            # z-score inside fold (no leakage)
+            X_tr, X_va_real = _zscore_fit_apply(X_tr_raw, X_va_real_raw)
 
             # Train DDPM models per target on train_real only
             fold_models: dict[str, nn.Module] = {}
@@ -2052,17 +2185,6 @@ def main() -> None:
                 sfreq=float(sfreq),
             )
 
-            run_unet_classifier._epochs = int(args.cls_epochs)  # type: ignore[attr-defined]
-            run_unet_classifier._batch_size = int(args.cls_batch_size)  # type: ignore[attr-defined]
-            out_unet = run_unet_classifier(
-                X_train=X_tr,
-                y_train=y_tr,
-                X_test_real=X_va_real,
-                X_test_hybrid=X_va_hybrid,
-                y_test=y_va,
-                device=device,
-            )
-
             out_eeg = run_eegnet(
                 X_train=X_tr,
                 y_train=y_tr,
@@ -2074,7 +2196,7 @@ def main() -> None:
                 batch_size=int(args.cls_batch_size),
             )
 
-            for name, out in [("CSP+LDA", out_csp), ("FBCSP+LDA", out_f), ("U-Net", out_unet), ("EEGNet", out_eeg)]:
+            for name, out in [("CSP+LDA", out_csp), ("FBCSP+LDA", out_f), ("EEGNet", out_eeg)]:
                 no_cv = out.get("no_cv", {})
                 cv_acc[name].append(float(no_cv.get("acc_real", float("nan"))))
                 cv_acc_h[name].append(float(no_cv.get("acc_hybrid", float("nan"))))
@@ -2089,7 +2211,7 @@ def main() -> None:
             return float(np.mean(a)), float(np.std(a))
 
         cv_summary: dict[str, dict[str, float]] = {}
-        for name in ["CSP+LDA", "FBCSP+LDA", "U-Net", "EEGNet"]:
+        for name in ["CSP+LDA", "FBCSP+LDA", "EEGNet"]:
             m1, s1 = _mean_std(cv_acc[name])
             m2, s2 = _mean_std(cv_acc_h[name])
             cv_summary[name] = {"cv_acc_real_mean": m1, "cv_acc_real_std": s1, "cv_acc_h_mean": m2, "cv_acc_h_std": s2}
@@ -2098,6 +2220,10 @@ def main() -> None:
         # 2) Train on full TRAIN, eval on held-out TEST (raw04 + labels8 asc)
         # -------------------------------
         _log_section("DDPM: train per target channel on FULL TRAIN + Table 1 (MSE/Pearson) on TEST")
+
+        # Use precomputed full-TRAIN z-score (prepared above, no leakage into TEST).
+        X_train_full = epochs_train
+        X_test_real = epochs_test
 
         trained_models = {}
         trained_input_idxs = {}
@@ -2226,16 +2352,6 @@ def main() -> None:
             y_test=y_test,
             sfreq=float(sfreq),
         )
-        run_unet_classifier._epochs = int(args.cls_epochs)  # type: ignore[attr-defined]
-        run_unet_classifier._batch_size = int(args.cls_batch_size)  # type: ignore[attr-defined]
-        ddpm_acc_summary["U-Net"] = run_unet_classifier(
-            X_train=X_train_full,
-            y_train=y_train_full,
-            X_test_real=X_test_real,
-            X_test_hybrid=X_test_hybrid,
-            y_test=y_test,
-            device=device,
-        )
         ddpm_acc_summary["EEGNet"] = run_eegnet(
             X_train=X_train_full,
             y_train=y_train_full,
@@ -2299,7 +2415,7 @@ def main() -> None:
             "PARTIAL": X_test_partial,
             "FULL": X_test_hybrid,
         }
-        for clf_name in ["CSP+LDA", "FBCSP+LDA", "U-Net", "EEGNet"]:
+        for clf_name in ["CSP+LDA", "FBCSP+LDA", "EEGNet"]:
             print("\n" + "-" * 80)
             print(clf_name)
             print("-" * 80)
@@ -2314,15 +2430,6 @@ def main() -> None:
                         X_test_hybrid=X_h,
                         y_test=y_test,
                         sfreq=float(sfreq),
-                    )
-                elif clf_name == "U-Net":
-                    out = run_unet_classifier(
-                        X_train=X_train_full,
-                        y_train=y_train_full,
-                        X_test_real=X_test_real,
-                        X_test_hybrid=X_h,
-                        y_test=y_test,
-                        device=device,
                     )
                 else:
                     out = run_eegnet(
@@ -2762,7 +2869,7 @@ def main() -> None:
         y_test = labels_test
         X_test_hybrid_sgm = build_hybrid_epochs_sgm(X_test_real)
 
-        _log_section("SGM: hybrid TEST + CSP+LDA + FBCSP+LDA + U-Net + EEGNet")
+        _log_section("SGM: hybrid TEST + CSP+LDA + FBCSP+LDA + EEGNet")
         sgm_acc_summary["CSP+LDA"] = run_csp_lda(
             X_train=X_train,
             y_train=y_train,
@@ -2781,21 +2888,8 @@ def main() -> None:
             sfreq=float(sfreq),
         )
 
-        _log_section("SGM: U-Net classifier (real vs hybrid) + embeddings-CV")
-        run_unet_classifier._epochs = int(args.cls_epochs)  # type: ignore[attr-defined]
-        run_unet_classifier._batch_size = int(args.cls_batch_size)  # type: ignore[attr-defined]
-        print(f"[U-Net cfg] epochs={int(args.cls_epochs)} | batch_size={int(args.cls_batch_size)} | optimizer=Adam | lr=1e-4")
-        sgm_acc_summary["U-Net"] = run_unet_classifier(
-            X_train=X_train,
-            y_train=y_train,
-            X_test_real=X_test_real,
-            X_test_hybrid=X_test_hybrid_sgm,
-            y_test=y_test,
-            device=device,
-        )
-
-        _log_section("SGM: EEGNet (real vs hybrid) + embeddings-CV")
-        print(f"[EEGNet cfg] epochs={int(args.cls_epochs)} | batch_size={int(args.cls_batch_size)} | optimizer=Adam | lr=1e-4")
+        _log_section("SGM: EEGNet (real vs hybrid)")
+        print(f"[EEGNet cfg] epochs={int(args.cls_epochs)} | batch_size={int(args.cls_batch_size)} | optimizer=Adam | lr=1e-3")
         sgm_acc_summary["EEGNet"] = run_eegnet(
             X_train=X_train,
             y_train=y_train,
