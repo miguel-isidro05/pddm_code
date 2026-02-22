@@ -3352,7 +3352,7 @@ def main() -> None:
                     aspect="auto",
                     origin="lower",
                     extent=[float(times_4s.min()), float(times_4s.max()), float(freqs_w.min()), float(freqs_w.max())],
-                    cmap="RdBu_r",
+                    cmap="viridis",
                 )
                 ax_w.set_title(f"{ch_name} — Wavelet ({cond_name})")
                 ax_w.set_xlabel("Time (s)")
