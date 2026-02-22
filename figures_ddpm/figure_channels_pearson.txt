@@ -1,0 +1,3 @@
+channel	pearson_mean
+AF3	0.935300
+T8	0.604728
